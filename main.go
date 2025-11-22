@@ -40,14 +40,17 @@ type Particle struct {
 }
 
 type BirdPiece struct {
-	X        float64
-	Y        float64
-	VelX     float64
-	VelY     float64
-	Char     rune
-	OnGround bool
-	Bounces  int
-	Color    termbox.Attribute // Color of the piece (red or light gray)
+	X            float64
+	Y            float64
+	VelX         float64
+	VelY         float64
+	Char         rune
+	OnGround     bool
+	Bounces      int
+	Color        termbox.Attribute // Color of the piece (red or light gray)
+	StuckOnPipe  bool              // Whether piece is stuck on a pipe
+	StuckFrames  int               // Frames since piece got stuck on pipe
+	FellFromPipe bool              // Whether piece fell from a pipe (for splat effect)
 }
 
 type Powerup struct {
@@ -71,6 +74,7 @@ type Game struct {
 	LastPipeSpawnFrame       int     // Frame when last pipe was spawned
 	Dying                    bool
 	GameOver                 bool
+	DeathFrame               int // Frame when bird died (for delaying restart message)
 	Frame                    int
 	ScrollSpeed              float64 // Current scroll speed (decreases when bird dies)
 	BaseScrollSpeed          float64 // Base scroll speed (increases with checkpoints)
@@ -157,7 +161,8 @@ func main() {
 						game.Bird.Velocity = 0
 						game.InMenu = false
 						game.FirstLaunch = false
-					} else if game.GameOver {
+					} else if (game.Dying || game.GameOver) && game.DeathFrame >= 0 && game.Frame >= game.DeathFrame+60 {
+						// Only allow restart after the restart message is displayed (60 frame delay)
 						game = NewGame()
 						// Recalculate window position for centered display
 						termWidth, termHeight := termbox.Size()
@@ -212,6 +217,7 @@ func NewGame() *Game {
 		LastPipeSpawnFrame:       0,
 		Dying:                    false,
 		GameOver:                 false,
+		DeathFrame:               -1, // -1 means not dead yet
 		Frame:                    0,
 		ScrollSpeed:              0.7, // Start at slower speed
 		BaseScrollSpeed:          0.7, // Base speed increases with checkpoints
@@ -242,9 +248,20 @@ func NewGame() *Game {
 	}
 }
 
-func (g *Game) createPoof(x, y float64) {
+func (g *Game) createPoof(x, y float64, velocity float64) {
 	// Create multiple particles in random directions
-	for i := 0; i < 20; i++ {
+	// Number of particles increases with velocity (base 20, scales with velocity)
+	// Use absolute value of velocity and scale it
+	velocityMagnitude := math.Abs(velocity)
+	particleCount := 20 + int(velocityMagnitude*30) // Base 20, +30 per unit of velocity (increased from 15)
+	if particleCount < 20 {
+		particleCount = 20 // Minimum 20 particles
+	}
+	if particleCount > 200 {
+		particleCount = 200 // Maximum 200 particles (increased from 100)
+	}
+
+	for i := 0; i < particleCount; i++ {
 		speed := 0.3 + rand.Float64()*0.5 // Random speed between 0.3 and 0.8
 		// Randomly assign '*' to about 25% of particles for variety
 		char := '.'
@@ -319,34 +336,43 @@ func (g *Game) breakMenuBirdIntoPieces() {
 	// Append to existing pieces instead of replacing them
 	newPieces := []BirdPiece{
 		{
-			X:        birdXPos,
-			Y:        birdYPos,
-			VelX:     -0.3 + rand.Float64()*0.2, // Leftward drift
-			VelY:     birdVelY + rand.Float64()*0.3,
-			Char:     '(',
-			OnGround: false,
-			Bounces:  0,
-			Color:    g.randomPieceColor(),
+			X:            birdXPos,
+			Y:            birdYPos,
+			VelX:         -0.3 + rand.Float64()*0.2, // Leftward drift
+			VelY:         birdVelY + rand.Float64()*0.3,
+			Char:         '(',
+			OnGround:     false,
+			Bounces:      0,
+			Color:        g.randomPieceColor(),
+			StuckOnPipe:  false,
+			StuckFrames:  0,
+			FellFromPipe: false,
 		},
 		{
-			X:        birdXPos + 1,
-			Y:        birdYPos,
-			VelX:     rand.Float64()*0.4 - 0.2, // Random horizontal
-			VelY:     birdVelY + rand.Float64()*0.3,
-			Char:     'x',
-			OnGround: false,
-			Bounces:  0,
-			Color:    g.randomPieceColor(),
+			X:            birdXPos + 1,
+			Y:            birdYPos,
+			VelX:         rand.Float64()*0.4 - 0.2, // Random horizontal
+			VelY:         birdVelY + rand.Float64()*0.3,
+			Char:         'x',
+			OnGround:     false,
+			Bounces:      0,
+			Color:        g.randomPieceColor(),
+			StuckOnPipe:  false,
+			StuckFrames:  0,
+			FellFromPipe: false,
 		},
 		{
-			X:        birdXPos + 2,
-			Y:        birdYPos,
-			VelX:     0.3 + rand.Float64()*0.2, // Rightward drift
-			VelY:     birdVelY + rand.Float64()*0.3,
-			Char:     '>',
-			OnGround: false,
-			Bounces:  0,
-			Color:    g.randomPieceColor(),
+			X:            birdXPos + 2,
+			Y:            birdYPos,
+			VelX:         0.3 + rand.Float64()*0.2, // Rightward drift
+			VelY:         birdVelY + rand.Float64()*0.3,
+			Char:         '>',
+			OnGround:     false,
+			Bounces:      0,
+			Color:        g.randomPieceColor(),
+			StuckOnPipe:  false,
+			StuckFrames:  0,
+			FellFromPipe: false,
 		},
 	}
 
@@ -355,14 +381,17 @@ func (g *Game) breakMenuBirdIntoPieces() {
 	for _, char := range extraChars {
 		if rand.Float64() < 0.1 {
 			newPieces = append(newPieces, BirdPiece{
-				X:        birdXPos + rand.Float64()*3 - 1,   // Random position near bird
-				Y:        birdYPos + (rand.Float64()*2 - 1), // Slight vertical variation
-				VelX:     rand.Float64()*0.6 - 0.3,          // Random horizontal velocity
-				VelY:     birdVelY + rand.Float64()*0.4 - 0.2,
-				Char:     char,
-				OnGround: false,
-				Bounces:  0,
-				Color:    g.randomPieceColor(),
+				X:            birdXPos + rand.Float64()*3 - 1,   // Random position near bird
+				Y:            birdYPos + (rand.Float64()*2 - 1), // Slight vertical variation
+				VelX:         rand.Float64()*0.6 - 0.3,          // Random horizontal velocity
+				VelY:         birdVelY + rand.Float64()*0.4 - 0.2,
+				Char:         char,
+				OnGround:     false,
+				Bounces:      0,
+				Color:        g.randomPieceColor(),
+				StuckOnPipe:  false,
+				StuckFrames:  0,
+				FellFromPipe: false,
 			})
 		}
 	}
@@ -388,34 +417,43 @@ func (g *Game) breakBirdIntoPieces() {
 	// Create pieces with different velocities and random colors (50% red, 50% light gray)
 	g.Pieces = []BirdPiece{
 		{
-			X:        birdXPos,
-			Y:        birdYPos,
-			VelX:     -0.3 + rand.Float64()*0.2, // Leftward drift
-			VelY:     g.Bird.Velocity + rand.Float64()*0.3,
-			Char:     '(',
-			OnGround: false,
-			Bounces:  0,
-			Color:    g.randomPieceColor(),
+			X:            birdXPos,
+			Y:            birdYPos,
+			VelX:         -0.3 + rand.Float64()*0.2, // Leftward drift
+			VelY:         g.Bird.Velocity + rand.Float64()*0.3,
+			Char:         '(',
+			OnGround:     false,
+			Bounces:      0,
+			Color:        g.randomPieceColor(),
+			StuckOnPipe:  false,
+			StuckFrames:  0,
+			FellFromPipe: false,
 		},
 		{
-			X:        birdXPos + 1,
-			Y:        birdYPos,
-			VelX:     rand.Float64()*0.4 - 0.2, // Random horizontal
-			VelY:     g.Bird.Velocity + rand.Float64()*0.3,
-			Char:     'x',
-			OnGround: false,
-			Bounces:  0,
-			Color:    g.randomPieceColor(),
+			X:            birdXPos + 1,
+			Y:            birdYPos,
+			VelX:         rand.Float64()*0.4 - 0.2, // Random horizontal
+			VelY:         g.Bird.Velocity + rand.Float64()*0.3,
+			Char:         'x',
+			OnGround:     false,
+			Bounces:      0,
+			Color:        g.randomPieceColor(),
+			StuckOnPipe:  false,
+			StuckFrames:  0,
+			FellFromPipe: false,
 		},
 		{
-			X:        birdXPos + 2,
-			Y:        birdYPos,
-			VelX:     0.3 + rand.Float64()*0.2, // Rightward drift
-			VelY:     g.Bird.Velocity + rand.Float64()*0.3,
-			Char:     '>',
-			OnGround: false,
-			Bounces:  0,
-			Color:    g.randomPieceColor(),
+			X:            birdXPos + 2,
+			Y:            birdYPos,
+			VelX:         0.3 + rand.Float64()*0.2, // Rightward drift
+			VelY:         g.Bird.Velocity + rand.Float64()*0.3,
+			Char:         '>',
+			OnGround:     false,
+			Bounces:      0,
+			Color:        g.randomPieceColor(),
+			StuckOnPipe:  false,
+			StuckFrames:  0,
+			FellFromPipe: false,
 		},
 	}
 
@@ -424,14 +462,17 @@ func (g *Game) breakBirdIntoPieces() {
 	for _, char := range extraChars {
 		if rand.Float64() < 0.1 {
 			g.Pieces = append(g.Pieces, BirdPiece{
-				X:        birdXPos + rand.Float64()*3 - 1,   // Random position near bird
-				Y:        birdYPos + (rand.Float64()*2 - 1), // Slight vertical variation
-				VelX:     rand.Float64()*0.6 - 0.3,          // Random horizontal velocity
-				VelY:     g.Bird.Velocity + rand.Float64()*0.4 - 0.2,
-				Char:     char,
-				OnGround: false,
-				Bounces:  0,
-				Color:    g.randomPieceColor(),
+				X:            birdXPos + rand.Float64()*3 - 1,   // Random position near bird
+				Y:            birdYPos + (rand.Float64()*2 - 1), // Slight vertical variation
+				VelX:         rand.Float64()*0.6 - 0.3,          // Random horizontal velocity
+				VelY:         g.Bird.Velocity + rand.Float64()*0.4 - 0.2,
+				Char:         char,
+				OnGround:     false,
+				Bounces:      0,
+				Color:        g.randomPieceColor(),
+				StuckOnPipe:  false,
+				StuckFrames:  0,
+				FellFromPipe: false,
 			})
 		}
 	}
@@ -564,7 +605,6 @@ func (g *Game) Update() {
 
 	// Update bird pieces if they exist
 	if len(g.Pieces) > 0 {
-		allOnGround := true
 		// Iterate backwards to safely remove elements
 		for i := len(g.Pieces) - 1; i >= 0; i-- {
 			// Check bounds before accessing (slice might have been modified)
@@ -572,6 +612,48 @@ func (g *Game) Update() {
 				break
 			}
 			if !g.Pieces[i].OnGround {
+				// Check if piece is stuck on pipe
+				if g.Pieces[i].StuckOnPipe {
+					// Check if stuck piece is inside a bottom pipe segment - remove immediately
+					pieceX := int(g.Pieces[i].X)
+					pieceY := int(g.Pieces[i].Y)
+					removed := false
+					for _, pipe := range g.Pipes {
+						pipeX := int(pipe.X)
+						// Check if piece is at pipe X position
+						if pieceX == pipeX || pieceX == pipeX-1 {
+							bottomPipeTop := pipe.GapTop + pipe.GapSize
+							// Check if piece is inside the bottom pipe segment
+							if pieceY >= bottomPipeTop && pieceY < height-2 && bottomPipeTop < height-2 {
+								// Piece is stuck inside the pipe - remove it immediately with a poof
+								fallVelocity := 1.5 // Velocity for removal poof
+								g.createPoof(g.Pieces[i].X, g.Pieces[i].Y, fallVelocity)
+								// Remove the piece
+								g.Pieces = append(g.Pieces[:i], g.Pieces[i+1:]...)
+								removed = true
+								break
+							}
+						}
+					}
+					if removed {
+						// Piece was removed, continue to next piece
+						continue
+					}
+
+					g.Pieces[i].StuckFrames++
+					// After 3 seconds (90 frames at 30 FPS), make piece fall
+					if g.Pieces[i].StuckFrames >= 90 {
+						g.Pieces[i].StuckOnPipe = false
+						g.Pieces[i].FellFromPipe = true // Mark that it fell from pipe
+						// Start falling with some downward velocity
+						g.Pieces[i].VelY = 0.5
+						// Continue to apply physics below
+					} else {
+						// Still stuck - don't apply physics
+						continue
+					}
+				}
+
 				// Update piece physics
 				g.Pieces[i].VelY += 0.10 // Gravity
 				g.Pieces[i].X += g.Pieces[i].VelX
@@ -580,28 +662,84 @@ func (g *Game) Update() {
 				// Create trail for each piece
 				g.createTrail(g.Pieces[i].X, g.Pieces[i].Y)
 
-				// Check for pipe collisions
-				pieceX := int(g.Pieces[i].X)
-				pieceY := int(g.Pieces[i].Y)
-				for _, pipe := range g.Pipes {
-					// Check if piece is at pipe X position (pipe spans X-1 and X)
-					pipeX := int(pipe.X)
-					if pieceX == pipeX || pieceX == pipeX-1 {
-						// Check if piece is in a pipe segment (not in the gap)
-						if pieceY < pipe.GapTop || pieceY >= pipe.GapTop+pipe.GapSize {
-							// Mark the specific pipe cell that was touched
-							key := fmt.Sprintf("pipe:%d,%d", pieceX, pieceY)
-							g.TouchedCells[key] = true
-							// Bounce the piece
-							if g.Pieces[i].Bounces < 2 {
-								g.Pieces[i].VelY = -g.Pieces[i].VelY * 0.6 // Bounce with reduced energy
-								g.Pieces[i].VelX *= 0.8                    // Reduce horizontal velocity
-								g.Pieces[i].Bounces++
-								g.Pieces[i].Y = float64(pieceY - 1) // Move piece up slightly
-							} else {
-								g.Pieces[i].OnGround = true
+				// Check for pipe collisions (skip if already stuck on pipe or falling from pipe)
+				if !g.Pieces[i].StuckOnPipe && !g.Pieces[i].FellFromPipe {
+					pieceX := int(g.Pieces[i].X)
+					pieceY := int(g.Pieces[i].Y)
+					for _, pipe := range g.Pipes {
+						// Check if piece is at pipe X position (pipe spans X-1 and X)
+						pipeX := int(pipe.X)
+						if pieceX == pipeX || pieceX == pipeX-1 {
+							// Check if piece is in a pipe segment (not in the gap)
+							if pieceY < pipe.GapTop || pieceY >= pipe.GapTop+pipe.GapSize {
+								// Mark the specific pipe cell that was touched
+								key := fmt.Sprintf("pipe:%d,%d", pieceX, pieceY)
+								g.TouchedCells[key] = true
+								// Bounce the piece
+								if g.Pieces[i].Bounces < 2 {
+									g.Pieces[i].VelY = -g.Pieces[i].VelY * 0.6 // Bounce with reduced energy
+									g.Pieces[i].VelX *= 0.8                    // Reduce horizontal velocity
+									g.Pieces[i].Bounces++
+									g.Pieces[i].Y = float64(pieceY - 1) // Move piece up slightly
+									// Reset stuck status if bouncing
+									g.Pieces[i].StuckOnPipe = false
+									g.Pieces[i].StuckFrames = 0
+								} else {
+									// Out of bounces - piece is stuck on pipe
+									g.Pieces[i].StuckOnPipe = true
+									g.Pieces[i].StuckFrames = 0 // Start counting stuck frames
+									g.Pieces[i].VelY = 0
+									g.Pieces[i].VelX = 0
+									// Don't set OnGround yet - it's stuck on pipe, not ground
+								}
 							}
 						}
+					}
+				}
+
+				// If piece is falling from pipe, check if it's on top of bottom pipe segment
+				if g.Pieces[i].FellFromPipe {
+					pieceX := int(g.Pieces[i].X)
+					pieceY := int(g.Pieces[i].Y)
+					onTopOfBottomPipe := false
+
+					for _, pipe := range g.Pipes {
+						pipeX := int(pipe.X)
+						// Check if piece is at pipe X position
+						if pieceX == pipeX || pieceX == pipeX-1 {
+							bottomPipeTop := pipe.GapTop + pipe.GapSize
+
+							// Check if piece is already inside the bottom pipe segment
+							if pieceY >= bottomPipeTop && pieceY < height-2 && bottomPipeTop < height-2 {
+								// Piece is inside the pipe - remove it with a poof
+								fallVelocity := 1.5 // Velocity for removal poof
+								g.createPoof(g.Pieces[i].X, g.Pieces[i].Y, fallVelocity)
+								// Remove the piece
+								g.Pieces = append(g.Pieces[:i], g.Pieces[i+1:]...)
+								onTopOfBottomPipe = true // Mark as handled
+								break
+							}
+
+							// Check if piece is on top of bottom pipe segment
+							// Piece should stop one position above the pipe (bottomPipeTop - 1) to rest on top
+							if pieceY >= bottomPipeTop-1 && pieceY < bottomPipeTop && bottomPipeTop > 0 && bottomPipeTop < height-2 {
+								// Piece is on top of bottom pipe - let it rest just above the pipe
+								g.Pieces[i].Y = float64(bottomPipeTop - 1)
+								g.Pieces[i].VelY = 0
+								g.Pieces[i].VelX = 0
+								g.Pieces[i].OnGround = true
+								// Create poof when piece stops falling on pipe
+								fallVelocity := 1.5 // Velocity for landing poof
+								g.createPoof(g.Pieces[i].X, g.Pieces[i].Y, fallVelocity)
+								g.Pieces[i].FellFromPipe = false // No longer falling
+								onTopOfBottomPipe = true
+								break
+							}
+						}
+					}
+
+					if !onTopOfBottomPipe {
+						// Continue falling - will check ground collision below
 					}
 				}
 
@@ -609,8 +747,8 @@ func (g *Game) Update() {
 				if i >= len(g.Pieces) || len(g.Pieces) == 0 {
 					break
 				}
-				// Check if piece hit the ground
-				if g.Pieces[i].Y >= float64(height-2) {
+				// Check if piece hit the ground (only if not already resting on bottom pipe)
+				if !g.Pieces[i].OnGround && g.Pieces[i].Y >= float64(height-2) {
 					// Mark ground cell as touched
 					groundX := int(g.Pieces[i].X)
 					if groundX >= 0 && groundX < width {
@@ -618,47 +756,52 @@ func (g *Game) Update() {
 						g.TouchedCells[key] = true
 					}
 
-					// Bounce if bounces remaining
-					if g.Pieces[i].Bounces < 2 {
-						g.Pieces[i].Y = float64(height - 2)
-						g.Pieces[i].VelY = -g.Pieces[i].VelY * 0.6 // Bounce with reduced energy
-						g.Pieces[i].VelX *= 0.8                    // Reduce horizontal velocity
-						g.Pieces[i].Bounces++
-					} else {
-						// No more bounces, stop on ground
+					// Calculate impact velocity for poof
+					impactVelocity := math.Abs(g.Pieces[i].VelY) + math.Abs(g.Pieces[i].VelX)
+					if impactVelocity < 0.5 {
+						impactVelocity = 0.5 // Minimum velocity for visible poof
+					}
+
+					// Create poof whenever any piece hits the ground
+					g.createPoof(g.Pieces[i].X, g.Pieces[i].Y, impactVelocity)
+
+					// If piece fell from pipe, stop immediately
+					if g.Pieces[i].FellFromPipe {
 						g.Pieces[i].Y = float64(height - 2)
 						g.Pieces[i].VelY = 0
 						g.Pieces[i].VelX = 0
 						g.Pieces[i].OnGround = true
+						// Reset tracking
+						g.Pieces[i].FellFromPipe = false
+						g.Pieces[i].StuckFrames = 0
+					} else {
+						// Normal piece - bounce if bounces remaining
+						if g.Pieces[i].Bounces < 2 {
+							g.Pieces[i].Y = float64(height - 2)
+							g.Pieces[i].VelY = -g.Pieces[i].VelY * 0.6 // Bounce with reduced energy
+							g.Pieces[i].VelX *= 0.8                    // Reduce horizontal velocity
+							g.Pieces[i].Bounces++
+						} else {
+							// No more bounces, stop on ground
+							g.Pieces[i].Y = float64(height - 2)
+							g.Pieces[i].VelY = 0
+							g.Pieces[i].VelX = 0
+							g.Pieces[i].OnGround = true
+						}
 					}
 				}
 
-				// Check if piece is still in the air
-				if i < len(g.Pieces) && len(g.Pieces) > 0 && !g.Pieces[i].OnGround {
-					allOnGround = false
-				}
-			} else {
-				// Check bounds before accessing
-				if i < len(g.Pieces) && len(g.Pieces) > 0 {
-					// Piece is on ground
-					if !g.Pieces[i].OnGround {
-						allOnGround = false
-					}
-				}
 			}
 		}
-		// If all pieces are on the ground, mark game over but continue animating
-		if allOnGround && !g.GameOver {
-			g.GameOver = true
-			g.Dying = false
-		}
+		// Note: GameOver is now set immediately when bird dies, not when pieces land
+		// Pieces continue animating even after game over
 
 		// Occasionally poof particles from random pieces on the ground when game is over (limit 5)
-		if g.GameOver && len(g.Pieces) > 0 && g.Frame%30 == 0 && g.GroundPoofs < 5 {
-			// Find pieces that are on the ground
+		if (g.Dying || g.GameOver) && len(g.Pieces) > 0 && g.Frame%30 == 0 && g.GroundPoofs < 5 {
+			// Find pieces that are on the ground or stuck on pipes
 			groundPieces := []int{}
 			for i, piece := range g.Pieces {
-				if piece.OnGround {
+				if piece.OnGround || piece.StuckOnPipe {
 					groundPieces = append(groundPieces, i)
 				}
 			}
@@ -667,7 +810,7 @@ func (g *Game) Update() {
 				randomIndex := groundPieces[rand.Intn(len(groundPieces))]
 				pieceIndex := randomIndex
 				piece := g.Pieces[pieceIndex]
-				g.createPoof(piece.X, piece.Y)
+				g.createPoof(piece.X, piece.Y, 0) // Ground poofs use base velocity
 				// Turn the piece red if it isn't already
 				if g.Pieces[pieceIndex].Color != termbox.ColorRed {
 					g.Pieces[pieceIndex].Color = termbox.ColorRed
@@ -704,21 +847,25 @@ func (g *Game) Update() {
 	if !g.GameOver && !g.Dying && !hasBirdPieces {
 		if g.Bird.Y < 1 {
 			// Bird hits top - dies
-			g.createPoof(float64(birdX+1), g.Bird.Y)
+			g.createPoof(float64(birdX+1), g.Bird.Y, g.Bird.Velocity)
 			g.Bird.Y = 1
 			g.breakBirdIntoPieces()
 			g.Dying = true
-			g.FlashFrames = 1 // Flash screen red
-			g.BawkFrames = 5  // Show "*BAWK*" message
+			g.GameOver = true      // Show game over immediately
+			g.DeathFrame = g.Frame // Track when bird died
+			g.FlashFrames = 1      // Flash screen red
+			g.BawkFrames = 5       // Show "*BAWK*" message
 		}
 		if g.Bird.Y >= float64(height-1) {
 			// Bird hits bottom - dies
-			g.createPoof(float64(birdX+1), float64(height-2))
+			g.createPoof(float64(birdX+1), float64(height-2), g.Bird.Velocity)
 			g.Bird.Y = float64(height - 2)
 			g.breakBirdIntoPieces()
 			g.Dying = true
-			g.FlashFrames = 1 // Flash screen red
-			g.BawkFrames = 5  // Show "*BAWK*" message
+			g.GameOver = true      // Show game over immediately
+			g.DeathFrame = g.Frame // Track when bird died
+			g.FlashFrames = 1      // Flash screen red
+			g.BawkFrames = 5       // Show "*BAWK*" message
 		}
 	}
 
@@ -838,12 +985,17 @@ func (g *Game) Update() {
 			// Check for collision with pipe
 			if g.checkCollision(g.Pipes[i]) {
 				// Bird hits pipe - dies
-				g.createPoof(float64(birdX+1), g.Bird.Y)
+				// Combine vertical velocity with scroll speed for impact velocity
+				// Scroll speed represents horizontal movement into the pipe
+				impactVelocity := math.Abs(g.Bird.Velocity) + g.ScrollSpeed
+				g.createPoof(float64(birdX+1), g.Bird.Y, impactVelocity)
 				g.breakBirdIntoPieces()
 				g.Dying = true
-				g.FlashFrames = 1 // Flash screen red
-				g.BawkFrames = 5  // Show "*BAWK*" message
-				break             // Exit pipe loop since bird is dead
+				g.GameOver = true      // Show game over immediately
+				g.DeathFrame = g.Frame // Track when bird died
+				g.FlashFrames = 1      // Flash screen red
+				g.BawkFrames = 5       // Show "*BAWK*" message
+				break                  // Exit pipe loop since bird is dead
 			}
 		}
 	}
@@ -937,7 +1089,7 @@ func (g *Game) updateMenuPieces() {
 			randomIndex := groundPieces[rand.Intn(len(groundPieces))]
 			pieceIndex := randomIndex
 			piece := g.Pieces[pieceIndex]
-			g.createPoof(piece.X, piece.Y)
+			g.createPoof(piece.X, piece.Y, 0) // Ground poofs use base velocity
 			// Turn the piece red if it isn't already
 			if g.Pieces[pieceIndex].Color != termbox.ColorRed {
 				g.Pieces[pieceIndex].Color = termbox.ColorRed
@@ -1100,7 +1252,9 @@ func (g *Game) updateMenuBird() {
 	// Check for side collisions - explode into pieces
 	if g.MenuBirdX < minX || g.MenuBirdX > maxX {
 		// Bird hit side - explode into pieces and particles
-		g.createPoof(g.MenuBirdX, g.MenuBirdY)
+		// Calculate velocity magnitude from X and Y components
+		velocityMagnitude := math.Sqrt(g.MenuBirdVelX*g.MenuBirdVelX + g.MenuBirdVelY*g.MenuBirdVelY)
+		g.createPoof(g.MenuBirdX, g.MenuBirdY, velocityMagnitude)
 		g.breakMenuBirdIntoPieces()
 		g.MenuBirdDead = true
 		g.MenuBirdDeathFrame = g.Frame
@@ -1131,7 +1285,9 @@ func (g *Game) updateMenuBird() {
 			// Check if bird flapped 14 or more times - explode on landing
 			if g.MenuBirdTotalFlaps >= 14 {
 				// Bird overexerted - explode into pieces and particles
-				g.createPoof(g.MenuBirdX, g.MenuBirdY)
+				// Calculate velocity magnitude from X and Y components
+				velocityMagnitude := math.Sqrt(g.MenuBirdVelX*g.MenuBirdVelX + g.MenuBirdVelY*g.MenuBirdVelY)
+				g.createPoof(g.MenuBirdX, g.MenuBirdY, velocityMagnitude)
 				g.breakMenuBirdIntoPieces()
 				g.MenuBirdDead = true
 				g.MenuBirdDeathFrame = g.Frame
@@ -1545,8 +1701,8 @@ func (g *Game) Render() {
 		}
 	}
 
-	// Draw game over message
-	if g.GameOver {
+	// Draw game over message (show immediately when bird dies)
+	if g.Dying || g.GameOver {
 		// Flash "YOU DIED" in red
 		msg := "YOU DIED"
 		startX := (width - len(msg)) / 2
@@ -1561,28 +1717,33 @@ func (g *Game) Render() {
 			}
 		}
 
-		// "Press SPACE to restart" in white
-		msg2 := "Press SPACE to restart"
-		startX2 := (width - len(msg2)) / 2
-		for i, r := range msg2 {
-			if startX2+i < width {
-				g.setCell(startX2+i, height/2, r, termbox.ColorWhite, termbox.ColorDefault)
+		// Show restart/quit messages after 60 frames (2 seconds at 30 FPS) delay
+		if g.DeathFrame >= 0 && g.Frame >= g.DeathFrame+60 {
+			// "Press SPACE to restart" in white
+			msg2 := "Press SPACE to restart"
+			startX2 := (width - len(msg2)) / 2
+			for i, r := range msg2 {
+				if startX2+i < width {
+					g.setCell(startX2+i, height/2, r, termbox.ColorWhite, termbox.ColorDefault)
+				}
 			}
-		}
 
-		msg3 := "Press ESC to quit"
-		startX3 := (width - len(msg3)) / 2
-		for i, r := range msg3 {
-			if startX3+i < width {
-				g.setCell(startX3+i, height/2+1, r, termbox.ColorWhite, termbox.ColorDefault)
+			msg3 := "Press ESC to quit"
+			startX3 := (width - len(msg3)) / 2
+			for i, r := range msg3 {
+				if startX3+i < width {
+					g.setCell(startX3+i, height/2+1, r, termbox.ColorWhite, termbox.ColorDefault)
+				}
 			}
 		}
 	} else {
-		// Draw instructions
-		msg := "Press SPACE to flap"
-		for i, r := range msg {
-			if i < width {
-				g.setCell(i, height-2, r, termbox.ColorCyan, termbox.ColorDefault)
+		// Draw instructions (only show when game is active and bird is not dying)
+		if !g.Dying && !g.GameOver {
+			msg := "Press SPACE to flap"
+			for i, r := range msg {
+				if i < width {
+					g.setCell(i, height-2, r, termbox.ColorCyan, termbox.ColorDefault)
+				}
 			}
 		}
 	}
