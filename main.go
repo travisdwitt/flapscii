@@ -50,15 +50,25 @@ type BirdPiece struct {
 	Color    termbox.Attribute // Color of the piece (red or light gray)
 }
 
+type Powerup struct {
+	X      float64
+	Y      float64
+	Active bool // Whether powerup is active (not collected yet)
+	Points int  // Points value (+1 to +10)
+}
+
 type Game struct {
 	Bird                     Bird
 	Pipes                    []Pipe
 	Particles                []Particle
 	Pieces                   []BirdPiece
+	Powerup                  *Powerup        // Points powerup (nil if none)
 	TouchedCells             map[string]bool // Track touched cells: "x,y" -> true
 	WhiteTouchedCells        map[string]bool // Track white touched cells: "x,y" -> true
 	Score                    int
-	LastCheckpoint           int // Track last checkpoint to create confetti only once
+	PipesPassed              int     // Number of pipes passed (for speed calculation)
+	PipeSpawnInterval        float64 // Current pipe spawn interval in frames (decreases as pipes pass)
+	LastPipeSpawnFrame       int     // Frame when last pipe was spawned
 	Dying                    bool
 	GameOver                 bool
 	Frame                    int
@@ -68,6 +78,8 @@ type Game struct {
 	BawkFrames               int     // Frames remaining to show "*BAWK*" message
 	GroundPoofs              int     // Number of poofs created from ground pieces
 	FlapFrames               int     // Frames remaining to show wing down animation
+	PowerupMessageFrames     int     // Frames remaining to show powerup message
+	LastPowerupPoints        int     // Points value of last collected powerup (for message display)
 	SpacePressed             bool    // Whether space is currently being held
 	SpacePressStartFrame     int     // Frame when space was first pressed
 	SpaceHoldDuration        int     // How long space has been held (in frames)
@@ -191,10 +203,13 @@ func NewGame() *Game {
 		Pipes:                    []Pipe{},
 		Particles:                []Particle{},
 		Pieces:                   []BirdPiece{},
+		Powerup:                  nil,
 		TouchedCells:             make(map[string]bool),
 		WhiteTouchedCells:        make(map[string]bool),
 		Score:                    0,
-		LastCheckpoint:           -1,
+		PipesPassed:              0,
+		PipeSpawnInterval:        60.0, // Start with 60 frame interval
+		LastPipeSpawnFrame:       0,
 		Dying:                    false,
 		GameOver:                 false,
 		Frame:                    0,
@@ -204,6 +219,7 @@ func NewGame() *Game {
 		BawkFrames:               0,   // No bawk message initially
 		GroundPoofs:              0,   // No ground poofs initially
 		FlapFrames:               0,   // No flap animation initially
+		PowerupMessageFrames:     0,   // No powerup message initially
 		SpacePressed:             false,
 		SpacePressStartFrame:     0,
 		SpaceHoldDuration:        0,
@@ -265,18 +281,17 @@ func (g *Game) createTrail(x, y float64) {
 	}
 }
 
-func (g *Game) createConfetti(x, y float64) {
-	// Create colorful confetti particles poofing from the bird's position
+func (g *Game) createGoldConfetti(x, y float64) {
+	// Create yellow/gold confetti particles for points powerup
+	// Use yellow and variations for gold effect
 	colors := []termbox.Attribute{
-		termbox.ColorRed,
-		termbox.ColorGreen,
 		termbox.ColorYellow,
-		termbox.ColorBlue,
-		termbox.ColorMagenta,
-		termbox.ColorCyan,
+		termbox.ColorYellow,
+		termbox.ColorYellow,
+		termbox.ColorYellow,
 	}
 
-	// Create confetti poofing outward from bird position
+	// Create confetti poofing outward from powerup position
 	for i := 0; i < 30; i++ {
 		speed := 0.4 + rand.Float64()*0.6 // Random speed between 0.4 and 1.0
 		color := colors[rand.Intn(len(colors))]
@@ -459,23 +474,20 @@ func (g *Game) Update() {
 		g.FlapFrames--
 	}
 
+	// Decrement powerup message frames
+	if g.PowerupMessageFrames > 0 {
+		g.PowerupMessageFrames--
+	}
+
 	// Increase base scroll speed after every pipe passed
 	if !g.Dying && !g.GameOver {
-		// Calculate what the base speed should be based on score
-		targetBaseSpeed := 0.7 + float64(g.Score)*0.05
+		// Calculate what the base speed should be based on pipes passed
+		targetBaseSpeed := 0.7 + float64(g.PipesPassed)*0.05
 		// Only update if it's higher than current base (speed only increases, never decreases)
 		if targetBaseSpeed > g.BaseScrollSpeed {
 			g.BaseScrollSpeed = targetBaseSpeed
 		}
 		g.ScrollSpeed = g.BaseScrollSpeed
-
-		// Create confetti when passing a checkpoint (every 10 pipes, only once per checkpoint)
-		checkpoint := g.Score / 10
-		if g.Score > 0 && g.Score%10 == 0 && checkpoint > g.LastCheckpoint {
-			// Confetti poofs from the bird's position
-			g.createConfetti(float64(birdX+1), g.Bird.Y)
-			g.LastCheckpoint = checkpoint
-		}
 	}
 
 	// Decrease scroll speed when dying (momentum loss)
@@ -553,7 +565,12 @@ func (g *Game) Update() {
 	// Update bird pieces if they exist
 	if len(g.Pieces) > 0 {
 		allOnGround := true
-		for i := range g.Pieces {
+		// Iterate backwards to safely remove elements
+		for i := len(g.Pieces) - 1; i >= 0; i-- {
+			// Check bounds before accessing (slice might have been modified)
+			if i >= len(g.Pieces) || len(g.Pieces) == 0 {
+				break
+			}
 			if !g.Pieces[i].OnGround {
 				// Update piece physics
 				g.Pieces[i].VelY += 0.10 // Gravity
@@ -588,6 +605,10 @@ func (g *Game) Update() {
 					}
 				}
 
+				// Check bounds again before accessing (slice might have been modified)
+				if i >= len(g.Pieces) || len(g.Pieces) == 0 {
+					break
+				}
 				// Check if piece hit the ground
 				if g.Pieces[i].Y >= float64(height-2) {
 					// Mark ground cell as touched
@@ -612,8 +633,17 @@ func (g *Game) Update() {
 					}
 				}
 
-				if !g.Pieces[i].OnGround {
+				// Check if piece is still in the air
+				if i < len(g.Pieces) && len(g.Pieces) > 0 && !g.Pieces[i].OnGround {
 					allOnGround = false
+				}
+			} else {
+				// Check bounds before accessing
+				if i < len(g.Pieces) && len(g.Pieces) > 0 {
+					// Piece is on ground
+					if !g.Pieces[i].OnGround {
+						allOnGround = false
+					}
 				}
 			}
 		}
@@ -669,8 +699,11 @@ func (g *Game) Update() {
 	}
 
 	// Check collisions with top/bottom
-	if !g.GameOver && !g.Dying && len(g.Pieces) == 0 {
+	// Only check if no bird pieces exist
+	hasBirdPieces := len(g.Pieces) > 0
+	if !g.GameOver && !g.Dying && !hasBirdPieces {
 		if g.Bird.Y < 1 {
+			// Bird hits top - dies
 			g.createPoof(float64(birdX+1), g.Bird.Y)
 			g.Bird.Y = 1
 			g.breakBirdIntoPieces()
@@ -679,6 +712,7 @@ func (g *Game) Update() {
 			g.BawkFrames = 5  // Show "*BAWK*" message
 		}
 		if g.Bird.Y >= float64(height-1) {
+			// Bird hits bottom - dies
 			g.createPoof(float64(birdX+1), float64(height-2))
 			g.Bird.Y = float64(height - 2)
 			g.breakBirdIntoPieces()
@@ -689,16 +723,76 @@ func (g *Game) Update() {
 	}
 
 	// Generate new pipes (only if screen is still scrolling)
-	if g.ScrollSpeed > 0 && g.Frame%60 == 0 {
-		gapSize := 8
-		gapTop := rand.Intn(height-gapSize-4) + 2
-		g.Pipes = append(g.Pipes, Pipe{
-			X:            float64(width - 1),
-			GapTop:       gapTop,
-			GapSize:      gapSize,
-			TouchedYs:    make(map[int]bool),
-			TouchedCells: make(map[string]bool),
-		})
+	// Spawn rate increases (interval decreases) by 0.15 for each pipe passed
+	if g.ScrollSpeed > 0 {
+		// Calculate current spawn interval (decreases by 0.15 per pipe passed, minimum 1.0)
+		currentInterval := 60.0 - float64(g.PipesPassed)*0.15
+		if currentInterval < 1.0 {
+			currentInterval = 1.0
+		}
+		g.PipeSpawnInterval = currentInterval
+
+		// Check if it's time to spawn a new pipe
+		framesSinceLastSpawn := g.Frame - g.LastPipeSpawnFrame
+		if float64(framesSinceLastSpawn) >= g.PipeSpawnInterval {
+			gapSize := 8
+			gapTop := rand.Intn(height-gapSize-4) + 2
+			g.Pipes = append(g.Pipes, Pipe{
+				X:            float64(width - 1),
+				GapTop:       gapTop,
+				GapSize:      gapSize,
+				TouchedYs:    make(map[int]bool),
+				TouchedCells: make(map[string]bool),
+			})
+			g.LastPipeSpawnFrame = g.Frame
+
+			// Spawn points powerup after 5 pipes (10% chance, only if no powerup exists)
+			if g.Score >= 5 && g.Powerup == nil && rand.Float64() < 0.10 {
+				// Spawn powerup in the gap of the pipe we just created
+				powerupY := float64(gapTop + gapSize/2)
+				// Random points value from +1 to +10
+				points := rand.Intn(10) + 1
+				g.Powerup = &Powerup{
+					X:      float64(width - 1),
+					Y:      powerupY,
+					Active: true,
+					Points: points,
+				}
+			}
+		}
+	}
+
+	// Update powerup position (move with scroll)
+	if g.Powerup != nil && g.Powerup.Active {
+		g.Powerup.X -= g.ScrollSpeed
+		// Remove powerup if it goes off screen
+		if g.Powerup.X < -2 {
+			g.Powerup = nil
+		}
+
+		// Check collision with bird (only if powerup still exists after potential removal)
+		if g.Powerup != nil {
+			birdXFloat := float64(birdX)
+			birdYFloat := g.Bird.Y
+			powerupX := int(g.Powerup.X)
+			powerupY := int(g.Powerup.Y)
+			birdXInt := int(birdXFloat)
+			birdYInt := int(birdYFloat)
+
+			// Check if bird is near powerup (within 2 cells)
+			if birdXInt >= powerupX-2 && birdXInt <= powerupX+2 &&
+				birdYInt >= powerupY-1 && birdYInt <= powerupY+1 {
+				// Collect powerup - add points and create gold confetti
+				points := g.Powerup.Points
+				g.Score += points
+				// Store points value for message display
+				g.LastPowerupPoints = points
+				// Create gold/yellow confetti at powerup position
+				g.createGoldConfetti(g.Powerup.X, g.Powerup.Y)
+				g.Powerup = nil
+				g.PowerupMessageFrames = 60 // Show message for 60 frames (~2 seconds at 30 FPS)
+			}
+		}
 	}
 
 	// Update pipes
@@ -713,6 +807,7 @@ func (g *Game) Update() {
 			g.Pipes = append(g.Pipes[:i], g.Pipes[i+1:]...)
 			if !g.Dying && !g.GameOver {
 				g.Score++
+				g.PipesPassed++
 			}
 			continue
 		}
@@ -736,12 +831,20 @@ func (g *Game) Update() {
 		}
 
 		// Check collision
-		if !g.GameOver && !g.Dying && len(g.Pieces) == 0 && g.checkCollision(g.Pipes[i]) {
-			g.createPoof(float64(birdX+1), g.Bird.Y)
-			g.breakBirdIntoPieces()
-			g.Dying = true
-			g.FlashFrames = 1 // Flash screen red
-			g.BawkFrames = 5  // Show "*BAWK*" message
+		// Only check if no bird pieces exist
+		hasBirdPieces := len(g.Pieces) > 0
+		// Check collision
+		if !g.GameOver && !g.Dying && !hasBirdPieces {
+			// Check for collision with pipe
+			if g.checkCollision(g.Pipes[i]) {
+				// Bird hits pipe - dies
+				g.createPoof(float64(birdX+1), g.Bird.Y)
+				g.breakBirdIntoPieces()
+				g.Dying = true
+				g.FlashFrames = 1 // Flash screen red
+				g.BawkFrames = 5  // Show "*BAWK*" message
+				break             // Exit pipe loop since bird is dead
+			}
 		}
 	}
 }
@@ -782,7 +885,8 @@ func (g *Game) updateMenuParticles() {
 
 func (g *Game) updateMenuPieces() {
 	// Update bird pieces in menu (simplified - no pipes)
-	for i := range g.Pieces {
+	// Iterate backwards to safely remove elements
+	for i := len(g.Pieces) - 1; i >= 0; i-- {
 		if !g.Pieces[i].OnGround {
 			// Update piece physics
 			g.Pieces[i].VelY += 0.10 // Gravity
@@ -1300,6 +1404,22 @@ func (g *Game) Render() {
 		}
 	}
 
+	// Draw powerup
+	if g.Powerup != nil && g.Powerup.Active {
+		powerupX := int(g.Powerup.X)
+		powerupY := int(g.Powerup.Y)
+		if powerupX >= 0 && powerupX < width && powerupY >= 0 && powerupY < height {
+			// Draw orange points powerup: +N (where N is 1-10)
+			// Use yellow as closest to orange (termbox doesn't have orange)
+			pointsStr := fmt.Sprintf("+%d", g.Powerup.Points)
+			for i, r := range pointsStr {
+				if powerupX+i >= 0 && powerupX+i < width {
+					g.setCell(powerupX+i, powerupY, r, termbox.ColorYellow, termbox.ColorDefault)
+				}
+			}
+		}
+	}
+
 	// Draw pipes
 	for _, pipe := range g.Pipes {
 		for y := 0; y < height; y++ {
@@ -1363,6 +1483,7 @@ func (g *Game) Render() {
 				birdColor = termbox.ColorRed
 			}
 
+			// Draw bird body: (o>
 			g.setCell(birdX, birdY, '(', birdColor, termbox.ColorDefault)
 			if birdX+1 < width {
 				g.setCell(birdX+1, birdY, birdChar, birdColor, termbox.ColorDefault)
@@ -1409,6 +1530,18 @@ func (g *Game) Render() {
 	for i, r := range scoreStr {
 		if i < width {
 			g.setCell(i, 0, r, termbox.ColorWhite, termbox.ColorDefault)
+		}
+	}
+
+	// Draw powerup message at top middle of screen (on line 1 to avoid score overlap)
+	if g.PowerupMessageFrames > 0 {
+		// Show the actual points value collected
+		message := fmt.Sprintf("+%d POINTS", g.LastPowerupPoints)
+		startX := (width - len(message)) / 2
+		for i, r := range message {
+			if startX+i >= 0 && startX+i < width && 1 < height {
+				g.setCell(startX+i, 1, r, termbox.ColorYellow, termbox.ColorDefault)
+			}
 		}
 	}
 
