@@ -68,6 +68,9 @@ type Game struct {
 	BawkFrames               int     // Frames remaining to show "*BAWK*" message
 	GroundPoofs              int     // Number of poofs created from ground pieces
 	FlapFrames               int     // Frames remaining to show wing down animation
+	SpacePressed             bool    // Whether space is currently being held
+	SpacePressStartFrame     int     // Frame when space was first pressed
+	SpaceHoldDuration        int     // How long space has been held (in frames)
 	WindowX                  int     // X offset for centered game window
 	WindowY                  int     // Y offset for centered game window
 	InMenu                   bool    // Whether showing the main menu
@@ -151,9 +154,14 @@ func main() {
 						game.InMenu = false // Skip menu after first launch
 						game.FirstLaunch = false
 					} else if !game.Dying {
-						// Only allow flapping if not dying
-						game.Bird.Velocity = -1.2 // Jump - reduced for better control
-						game.FlapFrames = 5       // Show wing down animation for 5 frames
+						// Start tracking space press (new press or continuing hold)
+						if !game.SpacePressed {
+							// New press - start tracking
+							game.SpacePressed = true
+							game.SpacePressStartFrame = game.Frame
+							game.SpaceHoldDuration = 0
+						}
+						// If already pressed, continue tracking (space is being held)
 					}
 					// If dying, ignore space presses - bird must fall
 				}
@@ -196,8 +204,11 @@ func NewGame() *Game {
 		BawkFrames:               0,   // No bawk message initially
 		GroundPoofs:              0,   // No ground poofs initially
 		FlapFrames:               0,   // No flap animation initially
-		WindowX:                  0,   // Will be set in main()
-		WindowY:                  0,   // Will be set in main()
+		SpacePressed:             false,
+		SpacePressStartFrame:     0,
+		SpaceHoldDuration:        0,
+		WindowX:                  0, // Will be set in main()
+		WindowY:                  0, // Will be set in main()
 		InMenu:                   false,
 		FirstLaunch:              false,
 		MenuBirdX:                float64(width) / 2,  // Start bird in center
@@ -421,6 +432,16 @@ func (g *Game) Update() {
 		g.updateMenuParticles()
 		g.updateMenuPieces()
 		return
+	}
+
+	// Handle space bar press - apply flap
+	if g.SpacePressed && !g.Dying && !g.GameOver {
+		// Apply flap with consistent strength regardless of press duration
+		g.Bird.Velocity = -0.8 // Consistent flap strength
+		g.FlapFrames = 5       // Show wing down animation
+		// Reset space pressed - will be set again if space is still held
+		// This way we only flap when space events are received
+		g.SpacePressed = false
 	}
 
 	// Decrement flash frames
