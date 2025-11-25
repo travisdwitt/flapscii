@@ -191,13 +191,24 @@ func main() {
 					game.BloodColor = (game.BloodColor + 1) % 5
 				}
 				if (ev.Key == termbox.KeyEnter || ev.Ch == '\r' || ev.Ch == '\n') && game.InMenu && !game.MenuBirdDead {
-					// Explode the menu bird when Enter is pressed
+					// Explode the menu bird when Enter is pressed - dramatic piece explosion!
 					velocityMagnitude := math.Sqrt(game.MenuBirdVelX*game.MenuBirdVelX + game.MenuBirdVelY*game.MenuBirdVelY)
 					if velocityMagnitude < 0.5 {
 						velocityMagnitude = 0.5 // Minimum velocity for visible poof
 					}
 					game.createPoof(game.MenuBirdX, game.MenuBirdY, velocityMagnitude)
 					game.breakMenuBirdIntoPieces()
+
+					// Make pieces fly apart dramatically with high velocities
+					for i := game.MenuBirdPiecesStart; i < len(game.Pieces); i++ {
+						// Give each piece a strong directional velocity for dramatic spread
+						// Use polar coordinates to create radial explosion pattern
+						angle := rand.Float64() * 2 * math.Pi // Random angle in all directions
+						speed := 1.5 + rand.Float64()*1.5     // Speed between 1.5 and 3.0
+						game.Pieces[i].VelX = math.Cos(angle) * speed
+						game.Pieces[i].VelY = math.Sin(angle) * speed
+					}
+
 					game.MenuBirdDead = true
 					game.MenuBirdDeathFrame = game.Frame
 					// Only set respawn frame if not already set (start counting when bird dies)
