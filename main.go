@@ -24,8 +24,8 @@ type Pipe struct {
 	X            float64 // Use float64 for smooth scrolling
 	GapTop       int
 	GapSize      int
-	TouchedYs    map[int]bool    // Track which Y positions of this pipe have been touched
-	TouchedCells map[string]bool // Track specific (X,Y) cells that were touched: "x,y"
+	TouchedYs    map[int]bool                 // Track which Y positions of this pipe have been touched
+	TouchedCells map[string]termbox.Attribute // Track specific (X,Y) cells that were touched: "x,y" -> color
 }
 
 type Particle struct {
@@ -65,9 +65,9 @@ type Game struct {
 	Pipes                    []Pipe
 	Particles                []Particle
 	Pieces                   []BirdPiece
-	Powerup                  *Powerup        // Points powerup (nil if none)
-	TouchedCells             map[string]bool // Track touched cells: "x,y" -> true
-	WhiteTouchedCells        map[string]bool // Track white touched cells: "x,y" -> true
+	Powerup                  *Powerup                     // Points powerup (nil if none)
+	TouchedCells             map[string]termbox.Attribute // Track touched cells: "x,y" -> color
+	WhiteTouchedCells        map[string]bool              // Track white touched cells: "x,y" -> true
 	Score                    int
 	PipesPassed              int     // Number of pipes passed (for speed calculation)
 	PipeSpawnInterval        float64 // Current pipe spawn interval in frames (decreases as pipes pass)
@@ -107,6 +107,7 @@ type Game struct {
 	MenuBirdFlyingToCenter   bool    // Whether bird is flying to center after respawn
 	MenuBirdPiecesStart      int     // Starting index of most recent bird's pieces in Pieces array
 	MenuBirdConsecutiveFlaps int     // Number of consecutive flaps in current sequence
+	BloodColor               int     // Blood color: 0=red, 1=blue, 2=confetti, 3=black, 4=none
 }
 
 func main() {
@@ -154,7 +155,7 @@ func main() {
 						// Clear menu bird pieces and particles
 						game.Pieces = []BirdPiece{}
 						game.Particles = []Particle{}
-						game.TouchedCells = make(map[string]bool)
+						game.TouchedCells = make(map[string]termbox.Attribute)
 						game.WhiteTouchedCells = make(map[string]bool)
 						// Reset bird position to halfway up the screen
 						game.Bird.Y = float64(height / 2)
@@ -163,7 +164,10 @@ func main() {
 						game.FirstLaunch = false
 					} else if (game.Dying || game.GameOver) && game.DeathFrame >= 0 && game.Frame >= game.DeathFrame+60 {
 						// Only allow restart after the restart message is displayed (60 frame delay)
+						// Preserve blood color setting
+						savedBloodColor := game.BloodColor
 						game = NewGame()
+						game.BloodColor = savedBloodColor // Restore blood color
 						// Recalculate window position for centered display
 						termWidth, termHeight := termbox.Size()
 						game.WindowX = (termWidth - width - 2) / 2
@@ -181,6 +185,27 @@ func main() {
 						// If already pressed, continue tracking (space is being held)
 					}
 					// If dying, ignore space presses - bird must fall
+				}
+				if ev.Key == termbox.KeyTab && game.InMenu {
+					// Cycle through blood colors: red -> blue -> confetti -> none -> poo -> red
+					game.BloodColor = (game.BloodColor + 1) % 5
+				}
+				if (ev.Key == termbox.KeyEnter || ev.Ch == '\r' || ev.Ch == '\n') && game.InMenu && !game.MenuBirdDead {
+					// Explode the menu bird when Enter is pressed
+					velocityMagnitude := math.Sqrt(game.MenuBirdVelX*game.MenuBirdVelX + game.MenuBirdVelY*game.MenuBirdVelY)
+					if velocityMagnitude < 0.5 {
+						velocityMagnitude = 0.5 // Minimum velocity for visible poof
+					}
+					game.createPoof(game.MenuBirdX, game.MenuBirdY, velocityMagnitude)
+					game.breakMenuBirdIntoPieces()
+					game.MenuBirdDead = true
+					game.MenuBirdDeathFrame = game.Frame
+					// Only set respawn frame if not already set (start counting when bird dies)
+					if game.MenuBirdRespawnFrame == 0 {
+						// Respawn after 7-12 seconds (at 30 FPS: 210-360 frames)
+						respawnDelay := 210 + rand.Intn(150) // 210-360 frames
+						game.MenuBirdRespawnFrame = game.Frame + respawnDelay
+					}
 				}
 			}
 		case <-ticker.C:
@@ -209,7 +234,7 @@ func NewGame() *Game {
 		Particles:                []Particle{},
 		Pieces:                   []BirdPiece{},
 		Powerup:                  nil,
-		TouchedCells:             make(map[string]bool),
+		TouchedCells:             make(map[string]termbox.Attribute),
 		WhiteTouchedCells:        make(map[string]bool),
 		Score:                    0,
 		PipesPassed:              0,
@@ -245,10 +270,83 @@ func NewGame() *Game {
 		MenuBirdFlyingToCenter:   false,
 		MenuBirdPiecesStart:      0,
 		MenuBirdConsecutiveFlaps: 0,
+		BloodColor:               0, // Default to red
 	}
 }
 
+func (g *Game) getBloodColor() (termbox.Attribute, bool) {
+	// Returns color and whether it's confetti
+	switch g.BloodColor {
+	case 0: // red
+		return termbox.ColorRed, false
+	case 1: // blue
+		return termbox.ColorBlue, false
+	case 2: // confetti
+		return termbox.ColorYellow, true // Will be randomized in confetti creation
+	case 3: // black
+		return termbox.ColorBlack, false
+	case 4: // none
+		return termbox.ColorDefault, false
+	default:
+		return termbox.ColorRed, false
+	}
+}
+
+func (g *Game) getTouchedCellColor(cellKey string) termbox.Attribute {
+	// Returns the color to use for touched cells (ground/pipe)
+	// For confetti mode, uses a deterministic random color based on cell position
+	if g.BloodColor == 4 {
+		return termbox.ColorGreen // No blood, use default green
+	}
+	if g.BloodColor == 2 {
+		// Confetti mode: use deterministic random color based on cell key
+		// This ensures the same cell always gets the same color
+		hash := 0
+		for _, c := range cellKey {
+			hash = hash*31 + int(c)
+		}
+		colors := []termbox.Attribute{
+			termbox.ColorRed,
+			termbox.ColorGreen,
+			termbox.ColorYellow,
+			termbox.ColorBlue,
+			termbox.ColorMagenta,
+			termbox.ColorCyan,
+		}
+		return colors[hash%len(colors)]
+	}
+	bloodColor, _ := g.getBloodColor()
+	return bloodColor
+}
+
+func (g *Game) getPieceBloodColor() termbox.Attribute {
+	// Returns the color to use for bird pieces when they change color
+	// For confetti mode, returns a random confetti color
+	if g.BloodColor == 4 {
+		return termbox.ColorWhite // No blood, keep white
+	}
+	if g.BloodColor == 2 {
+		// Confetti mode: return a random confetti color
+		colors := []termbox.Attribute{
+			termbox.ColorRed,
+			termbox.ColorGreen,
+			termbox.ColorYellow,
+			termbox.ColorBlue,
+			termbox.ColorMagenta,
+			termbox.ColorCyan,
+		}
+		return colors[rand.Intn(len(colors))]
+	}
+	bloodColor, _ := g.getBloodColor()
+	return bloodColor
+}
+
 func (g *Game) createPoof(x, y float64, velocity float64) {
+	// Skip if blood color is none
+	if g.BloodColor == 4 {
+		return
+	}
+
 	// Create multiple particles in random directions
 	// Number of particles increases with velocity (base 20, scales with velocity)
 	// Use absolute value of velocity and scale it
@@ -261,6 +359,8 @@ func (g *Game) createPoof(x, y float64, velocity float64) {
 		particleCount = 200 // Maximum 200 particles (increased from 100)
 	}
 
+	bloodColor, isConfetti := g.getBloodColor()
+
 	for i := 0; i < particleCount; i++ {
 		speed := 0.3 + rand.Float64()*0.5 // Random speed between 0.3 and 0.8
 		// Randomly assign '*' to about 25% of particles for variety
@@ -268,6 +368,21 @@ func (g *Game) createPoof(x, y float64, velocity float64) {
 		if rand.Float64() < 0.25 {
 			char = '*'
 		}
+
+		particleColor := bloodColor
+		if isConfetti {
+			// For confetti, use random colors
+			colors := []termbox.Attribute{
+				termbox.ColorRed,
+				termbox.ColorGreen,
+				termbox.ColorYellow,
+				termbox.ColorBlue,
+				termbox.ColorMagenta,
+				termbox.ColorCyan,
+			}
+			particleColor = colors[rand.Intn(len(colors))]
+		}
+
 		g.Particles = append(g.Particles, Particle{
 			X:          x,
 			Y:          y,
@@ -275,16 +390,37 @@ func (g *Game) createPoof(x, y float64, velocity float64) {
 			VelY:       speed * (rand.Float64()*2 - 1), // Random Y velocity
 			Life:       20,                             // Particle lifetime
 			Char:       char,
-			IsConfetti: false,
-			Color:      termbox.ColorRed,
+			IsConfetti: isConfetti,
+			Color:      particleColor,
 		})
 	}
 }
 
 func (g *Game) createTrail(x, y float64) {
+	// Skip if blood color is none
+	if g.BloodColor == 4 {
+		return
+	}
+
 	// Create trail particles that follow a piece as it falls
 	// Create 2-3 particles per frame for a continuous trail
+	bloodColor, isConfetti := g.getBloodColor()
+
 	for i := 0; i < 3; i++ {
+		particleColor := bloodColor
+		if isConfetti {
+			// For confetti, use random colors
+			colors := []termbox.Attribute{
+				termbox.ColorRed,
+				termbox.ColorGreen,
+				termbox.ColorYellow,
+				termbox.ColorBlue,
+				termbox.ColorMagenta,
+				termbox.ColorCyan,
+			}
+			particleColor = colors[rand.Intn(len(colors))]
+		}
+
 		g.Particles = append(g.Particles, Particle{
 			X:          x + (rand.Float64()*0.5 - 0.25), // Slight random offset
 			Y:          y,
@@ -292,8 +428,8 @@ func (g *Game) createTrail(x, y float64) {
 			VelY:       -0.1 + rand.Float64()*0.1,  // Slight upward velocity to trail behind
 			Life:       10,                         // Shorter lifetime for trail effect
 			Char:       '.',                        // Trail particles are always dots
-			IsConfetti: false,
-			Color:      termbox.ColorRed,
+			IsConfetti: isConfetti,
+			Color:      particleColor,
 		})
 	}
 }
@@ -402,9 +538,15 @@ func (g *Game) breakMenuBirdIntoPieces() {
 }
 
 func (g *Game) randomPieceColor() termbox.Attribute {
-	// 50% chance of red or light gray
+	// If blood color is none, always use white
+	if g.BloodColor == 4 {
+		return termbox.ColorWhite
+	}
+
+	bloodColor, _ := g.getBloodColor()
+	// 50% chance of blood color or light gray
 	if rand.Float64() < 0.5 {
-		return termbox.ColorRed
+		return bloodColor
 	}
 	return termbox.ColorWhite // Light gray
 }
@@ -560,11 +702,14 @@ func (g *Game) Update() {
 				if (particleX == pipeX || particleX == pipeX-1) && particleY >= 0 && particleY < height {
 					// Check if particle is in a pipe segment (not in gap)
 					if particleY < g.Pipes[j].GapTop || particleY >= g.Pipes[j].GapTop+g.Pipes[j].GapSize {
-						// Mark only the specific (X,Y) cell that was hit
-						cellKey := fmt.Sprintf("%d,%d", particleX, particleY)
-						g.Pipes[j].TouchedCells[cellKey] = true
-						// Also mark Y for backward compatibility
-						g.Pipes[j].TouchedYs[particleY] = true
+						// Mark only the specific (X,Y) cell that was hit (only if blood color is not none)
+						if g.BloodColor != 4 {
+							cellKey := fmt.Sprintf("%d,%d", particleX, particleY)
+							// Store the color for this cell (random for confetti)
+							g.Pipes[j].TouchedCells[cellKey] = g.getTouchedCellColor(cellKey)
+							// Also mark Y for backward compatibility
+							g.Pipes[j].TouchedYs[particleY] = true
+						}
 						// Remove particle when it hits pipe (block it)
 						g.Particles = append(g.Particles[:i], g.Particles[i+1:]...)
 						hitPipe = true
@@ -582,14 +727,15 @@ func (g *Game) Update() {
 		particleX := int(g.Particles[i].X)
 		particleY := int(g.Particles[i].Y)
 		if particleY >= height-1 {
-			// Mark ground cell (only if not confetti)
-			if !g.Particles[i].IsConfetti && particleX >= 0 && particleX < width {
+			// Mark ground cell (only if not confetti and blood color is not none)
+			if g.BloodColor != 4 && particleX >= 0 && particleX < width {
 				key := fmt.Sprintf("ground:%d,%d", particleX, height-1)
-				// If it's a white ',' particle, mark as white, otherwise mark as red
+				// If it's a white ',' particle, mark as white, otherwise mark as touched
 				if g.Particles[i].Char == ',' && g.Particles[i].Color == termbox.ColorWhite {
 					g.WhiteTouchedCells[key] = true
 				} else {
-					g.TouchedCells[key] = true
+					// Store the color for this cell (random for confetti)
+					g.TouchedCells[key] = g.getTouchedCellColor(key)
 				}
 			}
 			// Remove particle when it hits ground
@@ -672,9 +818,12 @@ func (g *Game) Update() {
 						if pieceX == pipeX || pieceX == pipeX-1 {
 							// Check if piece is in a pipe segment (not in the gap)
 							if pieceY < pipe.GapTop || pieceY >= pipe.GapTop+pipe.GapSize {
-								// Mark the specific pipe cell that was touched
-								key := fmt.Sprintf("pipe:%d,%d", pieceX, pieceY)
-								g.TouchedCells[key] = true
+								// Mark the specific pipe cell that was touched (only if blood color is not none)
+								if g.BloodColor != 4 {
+									key := fmt.Sprintf("pipe:%d,%d", pieceX, pieceY)
+									// Store the color for this cell (random for confetti)
+									g.TouchedCells[key] = g.getTouchedCellColor(key)
+								}
 								// Bounce the piece
 								if g.Pieces[i].Bounces < 2 {
 									g.Pieces[i].VelY = -g.Pieces[i].VelY * 0.6 // Bounce with reduced energy
@@ -749,11 +898,14 @@ func (g *Game) Update() {
 				}
 				// Check if piece hit the ground (only if not already resting on bottom pipe)
 				if !g.Pieces[i].OnGround && g.Pieces[i].Y >= float64(height-2) {
-					// Mark ground cell as touched
-					groundX := int(g.Pieces[i].X)
-					if groundX >= 0 && groundX < width {
-						key := fmt.Sprintf("ground:%d,%d", groundX, height-1)
-						g.TouchedCells[key] = true
+					// Mark ground cell as touched (only if blood color is not none)
+					if g.BloodColor != 4 {
+						groundX := int(g.Pieces[i].X)
+						if groundX >= 0 && groundX < width {
+							key := fmt.Sprintf("ground:%d,%d", groundX, height-1)
+							// Store the color for this cell (random for confetti)
+							g.TouchedCells[key] = g.getTouchedCellColor(key)
+						}
 					}
 
 					// Calculate impact velocity for poof
@@ -811,9 +963,10 @@ func (g *Game) Update() {
 				pieceIndex := randomIndex
 				piece := g.Pieces[pieceIndex]
 				g.createPoof(piece.X, piece.Y, 0) // Ground poofs use base velocity
-				// Turn the piece red if it isn't already
-				if g.Pieces[pieceIndex].Color != termbox.ColorRed {
-					g.Pieces[pieceIndex].Color = termbox.ColorRed
+				// Turn the piece to blood color if it isn't already
+				bloodColor := g.getPieceBloodColor()
+				if g.Pieces[pieceIndex].Color != bloodColor {
+					g.Pieces[pieceIndex].Color = bloodColor
 				}
 				g.GroundPoofs++ // Increment poof counter
 			}
@@ -889,7 +1042,7 @@ func (g *Game) Update() {
 				GapTop:       gapTop,
 				GapSize:      gapSize,
 				TouchedYs:    make(map[int]bool),
-				TouchedCells: make(map[string]bool),
+				TouchedCells: make(map[string]termbox.Attribute),
 			})
 			g.LastPipeSpawnFrame = g.Frame
 
@@ -968,11 +1121,14 @@ func (g *Game) Update() {
 			if (pieceX == pipeX || pieceX == pipeX-1) && pieceY >= 0 && pieceY < height {
 				// Check if piece is in a pipe segment (not in gap)
 				if pieceY < g.Pipes[i].GapTop || pieceY >= g.Pipes[i].GapTop+g.Pipes[i].GapSize {
-					// Mark this Y position of this pipe as touched (stays red as pipe moves)
-					g.Pipes[i].TouchedYs[pieceY] = true
-					// Also mark screen position for rendering
-					key := fmt.Sprintf("pipe:%d,%d", pieceX, pieceY)
-					g.TouchedCells[key] = true
+					// Mark this Y position of this pipe as touched (only if blood color is not none)
+					if g.BloodColor != 4 {
+						g.Pipes[i].TouchedYs[pieceY] = true
+						// Also mark screen position for rendering
+						key := fmt.Sprintf("pipe:%d,%d", pieceX, pieceY)
+						// Store the color for this cell (random for confetti)
+						g.TouchedCells[key] = g.getTouchedCellColor(key)
+					}
 				}
 			}
 		}
@@ -1013,14 +1169,15 @@ func (g *Game) updateMenuParticles() {
 		particleX := int(g.Particles[i].X)
 		particleY := int(g.Particles[i].Y)
 		if particleY >= height-1 {
-			// Mark ground cell (only if not confetti)
-			if !g.Particles[i].IsConfetti && particleX >= 0 && particleX < width {
+			// Mark ground cell (only if not confetti and blood color is not none)
+			if g.BloodColor != 4 && particleX >= 0 && particleX < width {
 				key := fmt.Sprintf("ground:%d,%d", particleX, height-1)
-				// If it's a white ',' particle, mark as white, otherwise mark as red
+				// If it's a white ',' particle, mark as white, otherwise mark as touched
 				if g.Particles[i].Char == ',' && g.Particles[i].Color == termbox.ColorWhite {
 					g.WhiteTouchedCells[key] = true
 				} else {
-					g.TouchedCells[key] = true
+					// Store the color for this cell (random for confetti)
+					g.TouchedCells[key] = g.getTouchedCellColor(key)
 				}
 			}
 			// Remove particle when it hits ground
@@ -1050,11 +1207,14 @@ func (g *Game) updateMenuPieces() {
 
 			// Check if piece hit the ground
 			if g.Pieces[i].Y >= float64(height-2) {
-				// Mark ground cell as touched
-				groundX := int(g.Pieces[i].X)
-				if groundX >= 0 && groundX < width {
-					key := fmt.Sprintf("ground:%d,%d", groundX, height-1)
-					g.TouchedCells[key] = true
+				// Mark ground cell as touched (only if blood color is not none)
+				if g.BloodColor != 4 {
+					groundX := int(g.Pieces[i].X)
+					if groundX >= 0 && groundX < width {
+						key := fmt.Sprintf("ground:%d,%d", groundX, height-1)
+						// Store the color for this cell (random for confetti)
+						g.TouchedCells[key] = g.getTouchedCellColor(key)
+					}
 				}
 
 				// Bounce if bounces remaining
@@ -1090,9 +1250,10 @@ func (g *Game) updateMenuPieces() {
 			pieceIndex := randomIndex
 			piece := g.Pieces[pieceIndex]
 			g.createPoof(piece.X, piece.Y, 0) // Ground poofs use base velocity
-			// Turn the piece red if it isn't already
-			if g.Pieces[pieceIndex].Color != termbox.ColorRed {
-				g.Pieces[pieceIndex].Color = termbox.ColorRed
+			// Turn the piece to blood color if it isn't already
+			bloodColor := g.getPieceBloodColor()
+			if g.Pieces[pieceIndex].Color != bloodColor {
+				g.Pieces[pieceIndex].Color = bloodColor
 			}
 			g.GroundPoofs++ // Increment poof counter
 		}
@@ -1215,8 +1376,8 @@ func (g *Game) updateMenuBird() {
 			} else {
 				g.MenuBirdVelX = -0.2
 			}
-			// If flapped more than 3 times, 10% chance to spawn white ',' particle
-			if g.MenuBirdConsecutiveFlaps > 3 && rand.Float64() < 0.1 {
+			// If flapped more than 3 times, 10% chance to spawn white ',' particle (only if blood color is not none)
+			if g.MenuBirdConsecutiveFlaps > 3 && rand.Float64() < 0.1 && g.BloodColor != 3 {
 				// Spawn white ',' particle from bird position
 				g.Particles = append(g.Particles, Particle{
 					X:          g.MenuBirdX + 1, // From bird's center
@@ -1421,6 +1582,16 @@ func (g *Game) Render() {
 			}
 		}
 
+		// Draw blood color setting
+		bloodColorNames := []string{"Red", "Blue", "Confetti", "Black", "None"}
+		bloodColorMsg := fmt.Sprintf("Blood Color (TAB): %s", bloodColorNames[g.BloodColor])
+		startX3 := (width - len(bloodColorMsg)) / 2
+		for i, r := range bloodColorMsg {
+			if startX3+i < width {
+				g.setCell(startX3+i, height/2+2, r, termbox.ColorCyan, termbox.ColorDefault)
+			}
+		}
+
 		// Draw menu bird on the ground (only if not dead)
 		if !g.MenuBirdDead {
 			birdX := int(g.MenuBirdX)
@@ -1483,8 +1654,8 @@ func (g *Game) Render() {
 			color := termbox.ColorGreen
 			if g.WhiteTouchedCells[key] {
 				color = termbox.ColorWhite
-			} else if g.TouchedCells[key] {
-				color = termbox.ColorRed
+			} else if storedColor, exists := g.TouchedCells[key]; exists {
+				color = storedColor
 			}
 			g.setCell(x, height-1, '═', color, termbox.ColorDefault)
 		}
@@ -1586,16 +1757,16 @@ func (g *Game) Render() {
 				if pipeX >= 0 && pipeX < width {
 					cellKey := fmt.Sprintf("%d,%d", pipeX, y)
 					color := termbox.ColorGreen
-					if pipe.TouchedCells[cellKey] {
-						color = termbox.ColorRed
+					if storedColor, exists := pipe.TouchedCells[cellKey]; exists {
+						color = storedColor
 					}
 					g.setCell(pipeX, y, '█', color, termbox.ColorDefault)
 				}
 				if pipeX-1 >= 0 && pipeX-1 < width {
 					cellKey := fmt.Sprintf("%d,%d", pipeX-1, y)
 					color := termbox.ColorGreen
-					if pipe.TouchedCells[cellKey] {
-						color = termbox.ColorRed
+					if storedColor, exists := pipe.TouchedCells[cellKey]; exists {
+						color = storedColor
 					}
 					g.setCell(pipeX-1, y, '█', color, termbox.ColorDefault)
 				}
@@ -1636,7 +1807,13 @@ func (g *Game) Render() {
 			birdChar := 'o'
 			if g.Dying || g.GameOver {
 				birdChar = 'x'
-				birdColor = termbox.ColorRed
+				// Use blood color for dying bird
+				if g.BloodColor == 4 {
+					birdColor = termbox.ColorWhite // No blood, keep white
+				} else {
+					bloodColor, _ := g.getBloodColor()
+					birdColor = bloodColor
+				}
 			}
 
 			// Draw bird body: (o>
@@ -1675,8 +1852,8 @@ func (g *Game) Render() {
 		color := termbox.ColorGreen
 		if g.WhiteTouchedCells[key] {
 			color = termbox.ColorWhite
-		} else if g.TouchedCells[key] {
-			color = termbox.ColorRed
+		} else if storedColor, exists := g.TouchedCells[key]; exists {
+			color = storedColor
 		}
 		g.setCell(x, height-1, '═', color, termbox.ColorDefault)
 	}
