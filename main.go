@@ -739,7 +739,7 @@ func (g *Game) Update() {
 		particleY := int(g.Particles[i].Y)
 		if particleY >= height-1 {
 			// Mark ground cell (only if not confetti and blood color is not none)
-			if g.BloodColor != 4 && particleX >= 0 && particleX < width {
+			if !g.Particles[i].IsConfetti && g.BloodColor != 4 && particleX >= 0 && particleX < width {
 				key := fmt.Sprintf("ground:%d,%d", particleX, height-1)
 				// If it's a white ',' particle, mark as white, otherwise mark as touched
 				if g.Particles[i].Char == ',' && g.Particles[i].Color == termbox.ColorWhite {
@@ -1181,7 +1181,7 @@ func (g *Game) updateMenuParticles() {
 		particleY := int(g.Particles[i].Y)
 		if particleY >= height-1 {
 			// Mark ground cell (only if not confetti and blood color is not none)
-			if g.BloodColor != 4 && particleX >= 0 && particleX < width {
+			if !g.Particles[i].IsConfetti && g.BloodColor != 4 && particleX >= 0 && particleX < width {
 				key := fmt.Sprintf("ground:%d,%d", particleX, height-1)
 				// If it's a white ',' particle, mark as white, otherwise mark as touched
 				if g.Particles[i].Char == ',' && g.Particles[i].Color == termbox.ColorWhite {
